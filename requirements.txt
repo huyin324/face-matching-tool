@@ -1,0 +1,31 @@
+# 依赖清单（仅供查阅；真正的一键安装由 launch.bat / launch.sh 完成）
+#
+# 重要：
+#   1) insightface 官方把 onnxruntime(CPU 版) 列为硬依赖，若直接 pip install insightface
+#      会与 onnxruntime-gpu 冲突并导致 GPU 失效。因此启动脚本统一采用：
+#         pip install insightface --no-deps
+#      再单独安装下面的依赖，确保 GPU 版 onnxruntime 成为实际被 import 的包。
+#   2) onnxruntime-gpu 必须锁定 CUDA 12.x 兼容版本：1.22.0（CUDA 12.4 + cuDNN 9）
+#      可前向兼容本机 CUDA 12.6。最新版（1.28+）要求 CUDA 13，在 RTX 3060 上会静默
+#      回退到 CPU，切勿使用 latest。
+#   3) 无 NVIDIA 显卡时，launch.bat 会自动改用 CPU 版 onnxruntime。
+
+# --- 人脸检测 / 识别 ---
+insightface                 # 以 --no-deps 方式安装
+onnxruntime-gpu==1.22.0     # 有 GPU 时；无 GPU 时脚本自动换为 onnxruntime
+onnx
+
+# --- 图像 / 数值 ---
+opencv-python-headless>=4.7.0
+pillow>=9.0.0
+numpy>=1.23.0               # 建议 <2.0（insightface 生态兼容性更稳）
+
+# --- UI ---
+pyqt5>=5.15.0
+
+# --- insightface 运行所需（因 --no-deps 而需手动补齐）---
+easydict
+prettytable
+pyyaml
+tqdm
+requests

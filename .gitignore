@@ -1,0 +1,35 @@
+# ---- Python ----
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+
+# ---- 虚拟环境 ----
+venv/
+.venv/
+env/
+
+# ---- 打包产物 ----
+build/
+dist/
+*.spec.bak
+
+# ---- 运行产物 / 日志 ----
+输出结果/
+*.log
+crash.log
+launch.log
+models/
+
+# ---- 工程本地目录 ----
+.workbuddy/
+
+# ---- 测试素材（含个人隐私照片，不入库）----
+测试视频.mp4
+目标人脸.png
+t_ascii.png
+
+# ---- 系统 ----
+.DS_Store
+Thumbs.db
+desktop.ini
