@@ -70,7 +70,7 @@ exe = EXE(
     a.binaries,
     a.datas,
     [],
-    name="视频人脸检测比对工具.exe",
+    name="视频人脸检测比对工具V1.2.exe",
     debug=False,
     bootloader_ignore_signals=False,
     strip=False,

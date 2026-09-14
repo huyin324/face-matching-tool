@@ -11,11 +11,16 @@
 - 人脸识别比对模式：检测画面人脸并与目标人脸比对，相似度 >= 阈值即比中并截取。
 - 人脸检测抓图模式：只要检测到的人脸质量 >= 质量阈值即截取（无需目标人脸）。
 
+两种分析模式（V1.2 新增，仅本地视频可选；RTSP 仅支持实时分析）：
+- 实时分析：按视频正常播放速度边播放边比对，预览即真实播放画面。
+- 全速分析：不按播放速度推进，尽最大算力全速解码 + 逐帧比对，尽快跑完整个视频；
+  预览显示分析进度画面，界面实时显示分析帧率（帧/s）。
+
 界面布局（PyQt5）：
 - 顶部：视频源（RTSP 实时流 / 本地视频 二选一）+ 输出目录
 - 上方右侧：参数设置（运行模式 / 相似度阈值 / 人脸质量阈值 / 截取前后秒数 / 人脸优选开关+优选时长 / 截取视频开关）
 - 中部左侧 1/4：目标人脸图（竖版，较高）+ 实时信息栏
-- 中部右侧 3/4：实时视频（带标题与框线，16:9）+ 倍速滑块 + 状态/进度
+- 中部右侧 3/4：实时视频（带标题与框线，16:9）+ 分析模式（实时/全速）+ 分析帧率 + 倍速滑块 + 状态/进度
 - 底部：日志栏
 - 操作：开始 / 暂停 / 结束
 
@@ -606,11 +611,22 @@ class PlaybackThread(threading.Thread):
       仅在 tight_box 模式下生效；其余模式维持解耦（显示流畅优先）。
     倍速：speed>1 时按 1/speed 的帧间隔推进；仅采样帧送检测（跳过帧不分析）。
     暂停：pause_event 置位时挂起读取。
+
+    分析模式（V1.2 新增，fullspeed）：
+      - False（实时分析，默认）：按视频帧率节流，边播放边比对，预览即真实播放画面。
+      - True（全速分析）：不等待播放节奏，**全速解码 + 逐帧送检测**，把算力全给比对，
+        尽量快地跑完全片；预览变成“分析进度画面”，帧率以「分析帧率」标签显示。
+        实现要点：
+          * 去掉 frame_interval 节流；
+          * det_q 改为**阻塞投递**（队列满则等待），保证一帧不漏地送检；
+          * 关闭紧跟踪门控（本就没有播放领先的概念）；
+          * 预览帧降频发送（disp_every）且队列满即丢，避免 UI 侧开销反向拖慢检测。
+        运行中可动态切换（每轮循环重新读取 self.fullspeed）。
     """
 
     def __init__(self, kind, src, disp_q, det_q, stop_event, pause_event,
                  src_idx, total_src, pad, speed=1, detect_every=2,
-                 tight_box=False, det_progress=None, max_lead=2):
+                 tight_box=False, det_progress=None, max_lead=2, fullspeed=False):
         super().__init__(daemon=True)
         self.kind = kind
         self.src = src
@@ -626,6 +642,9 @@ class PlaybackThread(threading.Thread):
         self.tight_box = tight_box
         self.det_progress = det_progress
         self.max_lead = max_lead
+        self.fullspeed = fullspeed
+        # 全速模式下预览帧发送间隔：每 N 帧才做一次缩放+投递，把 CPU 让给解码与检测
+        self.disp_every = 2
         self.fps = 25.0
         self.total = 0
         self.ring = None  # RTSP 用，由 Runner 注入
@@ -666,6 +685,20 @@ class PlaybackThread(threading.Thread):
                 q.put_nowait(item)
             except Exception:
                 pass
+
+    def _put_blocking(self, q, item):
+        """阻塞投递：队列满则等待检测消费（全速模式用，保证一帧不漏地送检）。
+
+        以 0.1s 为粒度轮询 stop_event，保证点「结束」时能立即退出而不永久卡住。
+        返回 False 表示期间收到了停止信号，调用方应结束循环。
+        """
+        while not self.stop_event.is_set():
+            try:
+                q.put(item, timeout=0.1)
+                return True
+            except queue.Full:
+                continue
+        return False
 
     def run(self):
         cap = None
@@ -728,13 +761,21 @@ class PlaybackThread(threading.Thread):
                     self.ring.append(f, t, frame)
                     while len(self.ring.dq) > ring_max:
                         self.ring.dq.popleft()
-                # 检测：始终按 detect_every 喂帧（保证检测线程持续工作，不被显示拖慢）
-                if f % self.detect_every == 0:
-                    self._put(self.det_q, ('det', self.src_idx, frame.copy(), f, t), 4)
+                # 每轮重新读取，支持运行中在「实时分析 / 全速分析」之间切换
+                fs = self.fullspeed
+                # 检测喂帧：全速模式逐帧阻塞投递（不丢帧）；实时模式按 detect_every 采样
+                if fs or (f % self.detect_every == 0):
+                    item = ('det', self.src_idx, frame.copy(), f, t)
+                    if fs:
+                        if not self._put_blocking(self.det_q, item):
+                            break  # 已被要求停止
+                    else:
+                        self._put(self.det_q, item, 4)
                 # 紧跟踪模式（滑块最右）：显示帧不领先检测超过 max_lead 帧，
                 # 用“降低播放流畅度”换取目标框紧贴人脸。代价是显示会出现卡顿，
                 # 但检测滞后被限制在 max_lead 帧内，配合预测几乎无延迟。
-                if self.tight_box and self.det_progress is not None:
+                # 全速模式没有“播放领先”的概念，直接跳过该门控。
+                if (not fs) and self.tight_box and self.det_progress is not None:
                     waited = 0.0
                     while not self.stop_event.is_set():
                         last = self.det_progress.get('f', -1)
@@ -744,18 +785,22 @@ class PlaybackThread(threading.Thread):
                         waited += 0.004
                         if waited > 3.0:  # 安全网：检测卡死也不永久阻塞播放
                             break
-                # 显示：工作线程先缩放到显示尺寸，主线程只做“小帧→QPixmap”
-                disp_frame, scale = self._to_display(frame)
-                self._put(self.disp_q,
-                          ('raw', self.src_idx, disp_frame, f, t, scale), 3)
+                # 显示：工作线程先缩放到显示尺寸，主线程只做“小帧→QPixmap”。
+                # 全速模式下预览降频（每 disp_every 帧一次）且队列满即丢，
+                # 确保 UI 侧的画面缩放开销不会反向拖慢解码与检测。
+                if (not fs) or (f % self.disp_every == 0):
+                    disp_frame, scale = self._to_display(frame)
+                    self._put(self.disp_q,
+                              ('raw', self.src_idx, disp_frame, f, t, scale), 3)
                 # 进度（仅本地文件）
                 if self.kind != "rtsp" and total > 0:
                     pct = int(((self.src_idx) + min(1.0, f / total)) / self.total_src * 100)
                     if pct != last_prog:
                         self._put(self.disp_q, ('progress', pct))
                         last_prog = pct
-                # 倍速：整体按 1/speed 推进；暂停/正常均保证逐帧显示
-                time.sleep(frame_interval / self.speed)
+                # 节流：实时模式按倍速等待到下一帧；全速模式不等待，能跑多快跑多快
+                if not fs:
+                    time.sleep(frame_interval / self.speed)
                 f += 1
             self._put(self.disp_q, ('end', self.src_idx, None, f, t))
         except Exception as e:
@@ -808,6 +853,9 @@ class DetectThread(threading.Thread):
         # 人脸优选缓冲：当前优选窗口起始时间 + 窗口内质量最高的帧
         self._prefer_t0 = None
         self._prefer_best = None
+        # 分析帧率统计（每 0.5s 上报一次“实际完成检测的帧率”，供界面显示）
+        self._fps_n = 0
+        self._fps_t0 = time.time()
 
     def _put_res(self, item):
         try:
@@ -839,6 +887,19 @@ class DetectThread(threading.Thread):
             self._put_res(('log', f"  片段写入完成：{os.path.basename(self._clip_path) if self._clip_path else ''}"))
             self._clip_path = None
 
+    def _tick_fps(self):
+        """统计并上报分析帧率（单位时间实际完成检测的帧数）。
+
+        每 0.5s 汇总一次：太密的数字跳动无意义，太疏又看不出全速模式的提速效果。
+        """
+        self._fps_n += 1
+        now = time.time()
+        dt = now - self._fps_t0
+        if dt >= 0.5:
+            self._put_res(('detfps', self._fps_n / dt if dt > 0 else 0.0))
+            self._fps_n = 0
+            self._fps_t0 = now
+
     def run(self):
         while not self.stop_event.is_set() or not self.det_q.empty():
             try:
@@ -858,7 +919,11 @@ class DetectThread(threading.Thread):
                 self._frame_idx = 0
                 self._episode = 0
                 self._close_clip()
+                # 重置帧率统计，避免把上一源的速率混入新源
+                self._fps_n = 0
+                self._fps_t0 = time.time()
             self._process_frame(frame, f, t)
+            self._tick_fps()
         self._flush_prefer()  # 结束前落盘最后一个优选窗口
         self._close_clip()
         # 等待所有异步 I/O（片段编码 / 截图写盘）完成，避免“分析完成”时文件还没落盘
@@ -1056,7 +1121,8 @@ class RunnerThread(threading.Thread):
     """编排：加载模型 -> 启动检测线程 -> 逐个视频源播放。"""
 
     def __init__(self, sources, face, out, params, providers, use_gpu,
-                 stop_event, pause_event, disp_q, det_q, res_q, mode):
+                 stop_event, pause_event, disp_q, det_q, res_q, mode,
+                 analyze_mode='realtime'):
         super().__init__(daemon=True)
         self.sources = sources
         self.face = face
@@ -1070,6 +1136,7 @@ class RunnerThread(threading.Thread):
         self.det_q = det_q
         self.res_q = res_q
         self.mode = mode
+        self.analyze_mode = analyze_mode  # 'realtime' | 'fullspeed'
         self._active_pb = None
 
     def _put(self, item):
@@ -1101,6 +1168,8 @@ class RunnerThread(threading.Thread):
         balance = int(self.params.get('balance', 50))
         tight_box = balance >= 85  # 最右“紧跟踪”：牺牲流畅度换目标框紧贴
         detect_every = 1 if tight_box else max(1, int(round(1 + (100 - balance) / 16.67)))
+        # 全速分析：不做播放节流、逐帧检测；RTSP 无法脱离实时流，强制走实时分析
+        want_fullspeed = (self.analyze_mode == 'fullspeed')
         for si, (kind, src) in enumerate(self.sources, start=1):
             if self.stop_event.is_set():
                 break
@@ -1117,12 +1186,15 @@ class RunnerThread(threading.Thread):
                 ring = RingBuffer(maxlen=max(30, int((self.params['pad'] + 1.0) * 25) + 10))
             det.ring = ring
             speed = 1 if kind == 'rtsp' else int(self.params.get('speed', 1))
+            # 仅本地文件支持全速分析
+            fs = want_fullspeed and kind == 'file'
             pb = PlaybackThread(kind, src, self.disp_q, self.det_q, self.stop_event,
                                 self.pause_event, si - 1, total_src,
                                 self.params['pad'], speed=speed,
-                                detect_every=detect_every,
-                                tight_box=tight_box, det_progress=det_progress,
-                                max_lead=2)
+                                detect_every=1 if fs else detect_every,
+                                tight_box=False if fs else tight_box,
+                                det_progress=det_progress,
+                                max_lead=2, fullspeed=fs)
             pb.ring = ring
             self._active_pb = pb
             pb.start()
@@ -1158,7 +1230,7 @@ class VideoLabel(QLabel):
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("视频人脸检测比对工具V1.0_by_huyin")
+        self.setWindowTitle("视频人脸检测比对工具V1.2_by_huyin")
         # 工具图标（优先使用打包进 exe 的 icon.png；未打包时回退 icon.svg）
         _icon_path = None
         if getattr(sys, "frozen", False) and hasattr(sys, "_MEIPASS"):
@@ -1177,6 +1249,8 @@ class MainWindow(QMainWindow):
         self.face_path = ""
         self.mode = 'compare'          # 'compare' | 'detect'
         self.source_kind = 'file'      # 'file' | 'rtsp'
+        self.analyze_mode = 'realtime'  # 'realtime' | 'fullspeed'（全速仅本地视频可用）
+        self._an_guard = False         # 防止单选按钮联动导致递归
         self.file_list = []            # 本地视频路径列表
         self.running = False
         self.paused = False
@@ -1195,6 +1269,7 @@ class MainWindow(QMainWindow):
         self._cur_disp_src = -1
         self._episodes = 0
         self._framecount = 0
+        self._last_fps = 0.0       # 最近一次上报的分析帧率（用于完成时汇总）
         self.runner = None
         self.out = ""
         self.speed_val = 1
@@ -1208,7 +1283,7 @@ class MainWindow(QMainWindow):
         self._timer.timeout.connect(self._poll)
         self._timer.start(16)  # ~60fps 轮询：降低“读取→显示”延迟，播放与目标框更跟手
 
-        self._append_log("视频人脸检测比对工具 V1.0 启动")
+        self._append_log("视频人脸检测比对工具 V1.2 启动")
         self._append_log(f"运行环境：{'GPU (CUDA)' if self.use_gpu else 'CPU'}")
         self._append_log(self.note)
 
@@ -1450,13 +1525,34 @@ class MainWindow(QMainWindow):
         self.video_label.setText("未开始分析\n点击「开始」后此处实时显示画面")
         g_video.layout().addWidget(self.video_label, 1)
 
+        # 分析模式（V1.2）：本地视频可选「实时分析 / 全速分析」；RTSP 仅支持实时分析。
+        # 同一行右侧显示当前分析帧率（帧/s）。
+        h_an = QHBoxLayout()
+        h_an.addWidget(QLabel("分析模式："))
+        self.an_mode_bg = QButtonGroup(self)
+        self.rb_realtime = QRadioButton("实时分析")
+        self.rb_fullspeed = QRadioButton("全速分析")
+        self.rb_realtime.setChecked(True)
+        self.an_mode_bg.addButton(self.rb_realtime, 1)
+        self.an_mode_bg.addButton(self.rb_fullspeed, 2)
+        for rb in (self.rb_realtime, self.rb_fullspeed):
+            h_an.addWidget(rb)
+        self.an_mode_hint = QLabel("")
+        self.an_mode_hint.setStyleSheet("color:#94a3b8;font-size:10px;")
+        h_an.addWidget(self.an_mode_hint)
+        h_an.addStretch(1)
+        self.fps_label = QLabel("分析帧率：-- 帧/s")
+        self.fps_label.setStyleSheet("color:#0f766e;font-size:13px;font-weight:600;")
+        h_an.addWidget(self.fps_label)
+        g_video.layout().addLayout(h_an)
+
         # 倍速滑块
         h_speed = QHBoxLayout()
         h_speed.addWidget(QLabel("播放倍速："))
         self.speed_slider = QSlider(Qt.Horizontal)
         self.speed_slider.setRange(0, len(self.speed_steps) - 1)
         self.speed_slider.setValue(0)
-        self.speed_slider.setEnabled(False)
+        self.speed_slider.setEnabled(False)  # 初始禁用；运行后按「源+分析模式」启用
         self.speed_slider.valueChanged.connect(self._on_speed)
         h_speed.addWidget(self.speed_slider, 1)
         self.speed_label = QLabel("1X")
@@ -1508,8 +1604,13 @@ class MainWindow(QMainWindow):
         root.addLayout(lower)
 
         # 初始化控件可用状态
+        # 两个单选按钮都要接：切到「全速」时是 rb_fullspeed 变选中，
+        # 只接 rb_realtime 会漏掉该场景（它此时是取消选中，checked=False 被忽略）。
+        self.rb_realtime.toggled.connect(self._on_analyze_mode)
+        self.rb_fullspeed.toggled.connect(self._on_analyze_mode)
         self._on_source_toggle('file')
         self._on_mode_toggle('compare')
+        self._refresh_ctrl_states()
 
     # ---------------- 模式 / 源切换 ----------------
     def _on_mode_toggle(self, mode):
@@ -1544,6 +1645,62 @@ class MainWindow(QMainWindow):
             self.btn_add_video.setEnabled(True)
             self.btn_remove_video.setEnabled(True)
             self.btn_clear_video.setEnabled(True)
+        self._refresh_ctrl_states()
+
+    def _refresh_ctrl_states(self):
+        """统一刷新「源类型 + 分析模式 + 运行状态」相关控件的可用性。
+
+        规则：
+          - 全速分析仅本地视频支持；切到 RTSP 时强制回到实时分析（并禁用全速选项）；
+          - 全速分析不按播放速度推进，故「播放倍速」与「实时性平衡」滑块均禁用；
+          - 播放倍速只在「本地视频 + 实时分析 + 运行中」三个条件同时满足时可用。
+        """
+        is_file = (self.source_kind == 'file')
+
+        if not is_file and self.analyze_mode == 'fullspeed':
+            # 强制回到实时分析：setChecked 会触发 _on_analyze_mode，
+            # 用 _an_guard 挡住以免递归刷新
+            self._an_guard = True
+            self.rb_realtime.setChecked(True)
+            self._an_guard = False
+            self.analyze_mode = 'realtime'
+
+        full = (self.analyze_mode == 'fullspeed')
+        self.rb_fullspeed.setEnabled(is_file)
+        self.speed_slider.setEnabled(is_file and (not full) and self.running)
+        self.balance_slider.setEnabled(not full)
+        if not is_file:
+            self.an_mode_hint.setText("（RTSP 仅支持实时分析）")
+        elif full:
+            self.an_mode_hint.setText("（不按播放速度，全算力逐帧分析）")
+        else:
+            self.an_mode_hint.setText("")
+        self.speed_label.setText("—" if full else f"{self.speed_val}X")
+
+    def _on_analyze_mode(self, checked):
+        """分析模式单选切换（运行中也可即时切换，播放线程每轮循环重读该标志）。"""
+        if self._an_guard or not checked:
+            return
+        new_mode = 'fullspeed' if self.rb_fullspeed.isChecked() else 'realtime'
+        if new_mode == self.analyze_mode:
+            self._refresh_ctrl_states()
+            return
+        self.analyze_mode = new_mode
+        self._refresh_ctrl_states()
+        pb = getattr(self.runner, '_active_pb', None) if self.runner is not None else None
+        if pb is not None:
+            fs = (new_mode == 'fullspeed')
+            pb.fullspeed = fs
+            if fs:
+                pb.detect_every = 1    # 全速：强制逐帧检测
+                pb.tight_box = False   # 无“播放领先”概念，紧跟踪门控自动失效
+        if new_mode == 'fullspeed':
+            self._append_log("分析模式：全速分析（不按播放速度，全算力逐帧比对）")
+            self._set_status("全速分析中...")
+        else:
+            self._append_log("分析模式：实时分析（按视频速度边播放边比对）")
+            if self.running:
+                self._set_status("分析中...")
 
     # ---------------- 槽函数 ----------------
     def _select_face(self):
@@ -1638,6 +1795,9 @@ class MainWindow(QMainWindow):
             self.balance_val_label.setText("检测")
         else:
             self.balance_val_label.setText("紧跟踪")
+        # 全速分析强制逐帧检测、且不按播放速度推进，平衡档位在此模式下无意义
+        if self.analyze_mode == 'fullspeed':
+            return
         # 运行中实时调整检测密度 / 紧跟踪开关（本地视频与 RTSP 均支持）
         if self.runner is not None and self.runner._active_pb is not None:
             pb = self.runner._active_pb
@@ -1677,6 +1837,11 @@ class MainWindow(QMainWindow):
                 QMessageBox.warning(self, "提示", "请先选择有效的目标人脸图片。")
                 return
 
+        # 分析模式：RTSP 是实时流，无法脱离播放节奏全速跑，强制走实时分析
+        analyze_mode = self.analyze_mode
+        if self.source_kind == 'rtsp':
+            analyze_mode = 'realtime'
+
         out = self.out_dir.text().strip() or os.path.join(os.getcwd(), "输出结果")
         os.makedirs(out, exist_ok=True)
 
@@ -1689,6 +1854,7 @@ class MainWindow(QMainWindow):
             'speed': self.speed_val,
             'balance': self.balance_slider.value(),
             'enable_segment': self.chk_segment.isChecked(),
+            'analyze_mode': analyze_mode,
         }
         self.sources = sources
         self.out = out
@@ -1701,8 +1867,8 @@ class MainWindow(QMainWindow):
         self.btn_pause.setEnabled(True)
         self.btn_pause.setText("暂停")
         self.btn_end.setEnabled(True)
-        # 倍速仅本地视频可操作
-        self.speed_slider.setEnabled(self.source_kind == 'file')
+        # 倍速 / 平衡滑块的可用性由「源类型 + 分析模式 + 运行状态」统一决定
+        self._refresh_ctrl_states()
 
         self.progress.setRange(0, 100)
         self.progress.setValue(0)
@@ -1716,23 +1882,26 @@ class MainWindow(QMainWindow):
         self._cur_disp_src = -1
         self.episode_val.setText("出场片段：0")
         self.shot_val.setText("截图：0")
+        self.fps_label.setText("分析帧率：-- 帧/s")
         if self.mode == 'compare':
             self.sim_val.setText("当前相似度：--")
             self.match_val.setText("比对结果：未匹配")
         else:
             self.sim_val.setText("（检测模式）")
             self.match_val.setText("（检测模式）")
-        self._set_status("分析中...")
+        self._set_status("全速分析中..." if analyze_mode == 'fullspeed' else "分析中...")
         self._append_log("-" * 40)
         self._append_log(f"模式：{'人脸检测抓图' if self.mode == 'detect' else '人脸识别比对'}  "
                          f"源：{'RTSP' if self.source_kind == 'rtsp' else '本地视频'}  "
+                         f"分析：{'全速（不按播放速度）' if analyze_mode == 'fullspeed' else '实时（按视频速度）'}  "
                          f"质量阈值：{params['quality_threshold']:.0f}" +
                          (f"  相似度阈值：{self.sim_slider.value()}%" if self.mode == 'compare' else "") +
                          (f"  截取视频：{'开' if params['enable_segment'] else '关'}"))
         self.runner = RunnerThread(sources, self.face_path, out, params,
                                    self.providers, self.use_gpu, self.stop_event,
                                    self.pause_event, self.disp_q, self.det_q,
-                                   self.res_q, self.mode)
+                                   self.res_q, self.mode,
+                                   analyze_mode=analyze_mode)
         self.runner.start()
 
     def _toggle_pause(self):
@@ -1845,6 +2014,9 @@ class MainWindow(QMainWindow):
         elif k == 'framecount':
             self._framecount = item[1]
             self.shot_val.setText(f"截图：{item[1]}")
+        elif k == 'detfps':
+            self._last_fps = item[1]
+            self.fps_label.setText(f"分析帧率：{item[1]:.1f} 帧/s")
         elif k == 'done':
             self._on_done(item[1])
         elif k == 'error':
@@ -1977,7 +2149,7 @@ class MainWindow(QMainWindow):
         self.btn_pause.setEnabled(False)
         self.btn_pause.setText("暂停")
         self.btn_end.setEnabled(False)
-        self.speed_slider.setEnabled(False)
+        self._refresh_ctrl_states()  # 运行结束：收回倍速/平衡的操作权
         self._tracks = {}
         self._track_seq = 0
         self._set_status("完成")
@@ -1986,6 +2158,8 @@ class MainWindow(QMainWindow):
         self._append_log("=" * 40)
         self._append_log("分析完成！")
         self._append_log(f"视频源：{summary.get('total_src', 1)} 个")
+        self._append_log(f"分析模式：{'全速分析' if self.analyze_mode == 'fullspeed' else '实时分析'}"
+                         f"  末段分析帧率：约 {self._last_fps:.1f} 帧/s")
         self._append_log(f"出场片段：{self._episodes} 个")
         self._append_log(f"截图：{self._framecount} 张")
         self._append_log(f"结果保存于：{summary.get('out', '')}")
@@ -1999,7 +2173,7 @@ class MainWindow(QMainWindow):
         self.btn_pause.setEnabled(False)
         self.btn_pause.setText("暂停")
         self.btn_end.setEnabled(False)
-        self.speed_slider.setEnabled(False)
+        self._refresh_ctrl_states()  # 运行结束：收回倍速/平衡的操作权
         QMessageBox.critical(self, "运行错误", msg)
 
     def closeEvent(self, event):
