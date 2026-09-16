@@ -98,7 +98,8 @@
 
 ## 三、界面速览
 
-![界面预览](./ui_preview.png)
+![界面预览](<img width="1676" height="1389" alt="ui_preview" src="https://github.com/user-attachments/assets/d0c22745-3ac5-4cc1-9f66-3ec377d8a7bc" />)
+
 
 > 上图由 `ui_preview.png` 提供（V1.3 实机界面）。
 >
