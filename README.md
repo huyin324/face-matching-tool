@@ -98,11 +98,8 @@
 
 ## 三、界面速览
 
-![界面预览](<img width="1676" height="1389" alt="ui_preview" src="https://github.com/user-attachments/assets/d0c22745-3ac5-4cc1-9f66-3ec377d8a7bc" />)
+![界面预览]<img width="1676" height="1389" alt="ui_preview" src="https://github.com/user-attachments/assets/d0c22745-3ac5-4cc1-9f66-3ec377d8a7bc" />
 
-
-> 上图由 `ui_preview.png` 提供（V1.3 实机界面）。
->
 > V1.3 起为扁平化卡片式布局（PyQt6）：顶部「视频源」与「参数设置」两张卡片**各占 50% 宽**；
 > **日志栏通栏置于界面最底部（约 8 行可见）**，腾出的纵向空间全部给「目标人脸」栏（预览随窗口自适应放大）；
 > 复选框为自绘样式，**选中态显示 √ 对勾**；并取消了「播放倍速」滑块。
