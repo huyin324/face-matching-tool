@@ -1,7 +1,7 @@
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
 """
-人脸检测视频截取工具（PyQt5 版）
+人脸检测视频截取工具（PyQt6 版）
 ================================
 基于 insightface + onnxruntime 的 GUI 工具：上传目标人脸 + 视频/RTSP 流，
 实时播放视频并在画面叠加人脸框，命中目标人脸时截取前后各 N 秒视频片段
@@ -16,15 +16,21 @@
 - 全速分析：不按播放速度推进，尽最大算力全速解码 + 逐帧比对，尽快跑完整个视频；
   预览显示分析进度画面，界面实时显示分析帧率（帧/s）。
 
-界面布局（PyQt5）：
-- 顶部：视频源（RTSP 实时流 / 本地视频 二选一）+ 输出目录
-- 上方右侧：参数设置（运行模式 / 相似度阈值 / 人脸质量阈值 / 截取前后秒数 / 人脸优选开关+优选时长 / 截取视频开关）
-- 中部左侧 1/4：目标人脸图（竖版，较高）+ 实时信息栏
-- 中部右侧 3/4：实时视频（带标题与框线，16:9）+ 分析模式（实时/全速）+ 分析帧率 + 倍速滑块 + 状态/进度
-- 底部：日志栏
+界面布局（V1.3，PyQt6，扁平化卡片式）：
+- 顶部：视频源（RTSP 实时流 / 本地视频 二选一）+ 输出目录  |  参数设置
+- 中部左侧：目标人脸（竖版 3:4，占据左列全部纵向空间）+ 实时信息
+- 中部右侧：实时视频（16:9）+ 分析模式（实时/全速）+ 分析帧率 + 状态/进度 + 操作按钮
+- 底部：日志栏（通栏全宽）
 - 操作：开始 / 暂停 / 结束
 
-本文件为自包含实现（引擎 + PyQt5 界面）。
+V1.3 变更：
+1. 日志栏移至界面底部通栏；腾出的纵向空间全部给「目标人脸」栏。
+2. 取消播放倍速功能（播放恒定 1X；提速请改用「全速分析」）。
+3. 界面由 PyQt5 迁移到 PyQt6，改为扁平化现代化配色（卡片式面板、弱描边、统一间距）。
+4. 性能优化：显示管线改用 BGR 直通（省去每帧 cvtColor）、去掉多余的图像副本、
+   全速分析预览降频，降低 UI 线程占用。
+
+本文件为自包含实现（引擎 + PyQt6 界面）。
 """
 
 import os
@@ -37,7 +43,7 @@ from collections import deque
 
 # ---------------- 强制使用本工具自带的 venv 依赖 ----------------
 # 若用户机器上设置了 PYTHONPATH 指向“系统 Python 的 site-packages”，
-# 会导致 PyQt5 / insightface 等被优先从系统那一份（可能残缺）加载，
+# 会导致 PyQt6 / insightface 等被优先从系统那一份（可能残缺）加载，
 # 典型报错：Could not find the Qt platform plugin "windows"。
 # 因此在导入任何第三方库之前，把本 venv 的 site-packages 置顶，并强制
 # Qt 插件目录为 venv 内的插件，彻底规避该问题。
@@ -52,7 +58,7 @@ if os.path.isdir(_VENV_SP):
     if _VENV_SP not in sys.path:
         sys.path.insert(0, _VENV_SP)
     os.environ["QT_QPA_PLATFORM_PLUGIN_PATH"] = os.path.join(
-        _VENV_SP, "PyQt5", "Qt5", "plugins")
+        _VENV_SP, "PyQt6", "Qt6", "plugins")
 
 # ---------------- 打包(frozen)环境适配 ----------------
 # 打包成单 exe 后，所有依赖与模型均位于 PyInstaller 解压目录 sys._MEIPASS。
@@ -60,7 +66,7 @@ if getattr(sys, "frozen", False) and hasattr(sys, "_MEIPASS"):
     _MEI = sys._MEIPASS
     # 强制使用打包内的 Qt 插件，避免继承环境中错误的 QT_QPA_PLATFORM_PLUGIN_PATH
     os.environ["QT_QPA_PLATFORM_PLUGIN_PATH"] = os.path.join(
-        _MEI, "PyQt5", "Qt5", "plugins")
+        _MEI, "PyQt6", "Qt6", "plugins")
     # 模型根目录：打包后 buffalo_l 位于 <MEI>/models/buffalo_l
     _MODEL_ROOT = _MEI
 else:
@@ -68,6 +74,15 @@ else:
 
 import cv2
 import numpy as np
+
+# 【性能】限制 OpenCV 内部线程数：
+# OpenCV 默认会拉起与 CPU 核数相同的并行线程（本机 16），解码 / 缩放时会与
+# onnxruntime 的推理线程、以及播放/检测/显示三条线程争抢 CPU，实测会造成
+# 明显抖动（尤其全速分析时）。收到 4 之后总吞吐反而更稳。
+try:
+    cv2.setNumThreads(4)
+except Exception:
+    pass
 
 # ---------------- 第三方库可用性 ----------------
 try:
@@ -92,12 +107,14 @@ except Exception as e:
     _PIL_ERR = e
 
 try:
-    from PyQt5.QtCore import Qt, QTimer, QSize, QUrl
-    from PyQt5.QtGui import QImage, QPixmap, QFont, QColor, QPainter, QPen, QDesktopServices, QIcon
-    from PyQt5.QtWidgets import (
+    from PyQt6.QtCore import Qt, QTimer, QSize, QUrl, QRect, QRectF
+    from PyQt6.QtGui import (QImage, QPixmap, QFont, QColor, QPainter, QPen,
+                             QDesktopServices, QIcon, QFontDatabase,
+                             QPainterPath)
+    from PyQt6.QtWidgets import (
         QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
-        QLabel, QPushButton, QListWidget, QAbstractItemView, QCheckBox,
-        QLineEdit, QSpinBox, QDoubleSpinBox, QSlider, QProgressBar,
+        QGridLayout, QLabel, QPushButton, QListWidget, QAbstractItemView,
+        QCheckBox, QLineEdit, QSpinBox, QDoubleSpinBox, QSlider, QProgressBar,
         QTextEdit, QGroupBox, QFileDialog, QMessageBox, QScrollArea,
         QSizePolicy, QFrame, QRadioButton, QButtonGroup,
     )
@@ -183,7 +200,7 @@ def _global_excepthook(exc_type, exc_val, exc_tb):
     except Exception:
         pass
     try:
-        from PyQt5.QtWidgets import QMessageBox
+        from PyQt6.QtWidgets import QMessageBox
         try:
             QMessageBox.critical(None, "程序异常（已写入 crash.log）", msg)
         except Exception:
@@ -313,21 +330,32 @@ def draw_box(frame, bbox, label=None, color=(0, 0, 255), thickness=None):
     线宽默认 2（细），避免遮挡人脸；标注字体同步缩小。
     """
     out = frame.copy()
+    draw_box_inplace(out, bbox, label=label, color=color, thickness=thickness)
+    return out
+
+
+def draw_box_inplace(frame, bbox, label=None, color=(0, 0, 255), thickness=None):
+    """在 frame 上**原地**画框（不复制），直接修改传入的数组。
+
+    【性能】同一帧上要画多个人脸框时（预览叠加、检测抓图模式），
+    旧写法每画一个框就整帧 copy 一次（1080p 约 6MB/次），
+    10 张脸 = 10 次全帧拷贝。本函数让调用方只拷一次、循环原地画。
+    """
     x1, y1, x2, y2 = [int(round(v)) for v in bbox[:4]]
-    h, w = out.shape[:2]
+    h, w = frame.shape[:2]
     x1, y1 = max(0, x1), max(0, y1)
     x2, y2 = min(w, x2), min(h, y2)
     if thickness is None:
         thickness = 2
-    cv2.rectangle(out, (x1, y1), (x2, y2), color, thickness)
+    cv2.rectangle(frame, (x1, y1), (x2, y2), color, thickness)
     if label:
         font_scale = 0.5
         (lw, lh), base = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, font_scale, 1)
         ty = max(0, y1 - lh - 4)
-        cv2.rectangle(out, (x1, ty), (x1 + lw + 4, y1), color, -1)
-        cv2.putText(out, label, (x1 + 2, max(lh, y1 - 3)),
+        cv2.rectangle(frame, (x1, ty), (x1 + lw + 4, y1), color, -1)
+        cv2.putText(frame, label, (x1 + 2, max(lh, y1 - 3)),
                     cv2.FONT_HERSHEY_SIMPLEX, font_scale, (255, 255, 255), 1, cv2.LINE_AA)
-    return out
+    return frame
 
 
 def imread_utf8(path):
@@ -609,11 +637,10 @@ class PlaybackThread(threading.Thread):
     tight_box：滑块拉到最右（“紧跟踪”）时为 True。此时显示帧不领先检测超过
       max_lead 帧，用“牺牲播放流畅度”换取目标框紧贴人脸，彻底消除检测滞后。
       仅在 tight_box 模式下生效；其余模式维持解耦（显示流畅优先）。
-    倍速：speed>1 时按 1/speed 的帧间隔推进；仅采样帧送检测（跳过帧不分析）。
     暂停：pause_event 置位时挂起读取。
 
     分析模式（V1.2 新增，fullspeed）：
-      - False（实时分析，默认）：按视频帧率节流，边播放边比对，预览即真实播放画面。
+      - False（实时分析，默认）：按视频帧率节流（恒定 1X），边播放边比对。
       - True（全速分析）：不等待播放节奏，**全速解码 + 逐帧送检测**，把算力全给比对，
         尽量快地跑完全片；预览变成“分析进度画面”，帧率以「分析帧率」标签显示。
         实现要点：
@@ -622,10 +649,12 @@ class PlaybackThread(threading.Thread):
           * 关闭紧跟踪门控（本就没有播放领先的概念）；
           * 预览帧降频发送（disp_every）且队列满即丢，避免 UI 侧开销反向拖慢检测。
         运行中可动态切换（每轮循环重新读取 self.fullspeed）。
+
+    V1.3：取消播放倍速（speed）参数，实时分析恒定按视频原始帧率播放。
     """
 
     def __init__(self, kind, src, disp_q, det_q, stop_event, pause_event,
-                 src_idx, total_src, pad, speed=1, detect_every=2,
+                 src_idx, total_src, pad, detect_every=2,
                  tight_box=False, det_progress=None, max_lead=2, fullspeed=False):
         super().__init__(daemon=True)
         self.kind = kind
@@ -637,14 +666,15 @@ class PlaybackThread(threading.Thread):
         self.src_idx = src_idx
         self.total_src = total_src
         self.pad = pad
-        self.speed = speed
         self.detect_every = detect_every
         self.tight_box = tight_box
         self.det_progress = det_progress
         self.max_lead = max_lead
         self.fullspeed = fullspeed
-        # 全速模式下预览帧发送间隔：每 N 帧才做一次缩放+投递，把 CPU 让给解码与检测
-        self.disp_every = 2
+        # 全速模式下预览帧发送间隔：每 N 帧才做一次缩放+投递，把 CPU 让给解码与检测。
+        # 实测每次“缩放 + 建 QImage + 建 QPixmap”约 2~3ms，全速下每 3 帧发一帧
+        # （约 15fps 预览）完全够看，且能显著减少 UI 线程反向拖慢检测的概率。
+        self.disp_every = 3
         self.fps = 25.0
         self.total = 0
         self.ring = None  # RTSP 用，由 Runner 注入
@@ -798,9 +828,9 @@ class PlaybackThread(threading.Thread):
                     if pct != last_prog:
                         self._put(self.disp_q, ('progress', pct))
                         last_prog = pct
-                # 节流：实时模式按倍速等待到下一帧；全速模式不等待，能跑多快跑多快
+                # 节流：实时模式按视频原始帧率等待到下一帧；全速模式不等待，能跑多快跑多快
                 if not fs:
-                    time.sleep(frame_interval / self.speed)
+                    time.sleep(frame_interval)
                 f += 1
             self._put(self.disp_q, ('end', self.src_idx, None, f, t))
         except Exception as e:
@@ -1084,9 +1114,10 @@ class DetectThread(threading.Thread):
         self._frame_idx += 1
         if self.mode == 'detect':
             # 检测模式：把当前帧所有检出人脸都画框（不显示相似度）
+            # V1.3：只整帧拷贝一次，逐个原地画框（旧写法每画一个框就拷贝一次整帧）
             marked = frame.copy()
             for b in boxes:
-                marked = draw_box(marked, b['bbox'], label=None, color=(0, 170, 0))
+                draw_box_inplace(marked, b['bbox'], label=None, color=(0, 170, 0))
             name = f"检测帧_{self._frame_idx:03d}_{fmt_time(t).replace(':', '-')}.png"
         else:
             best = None
@@ -1185,12 +1216,11 @@ class RunnerThread(threading.Thread):
             if kind == "rtsp":
                 ring = RingBuffer(maxlen=max(30, int((self.params['pad'] + 1.0) * 25) + 10))
             det.ring = ring
-            speed = 1 if kind == 'rtsp' else int(self.params.get('speed', 1))
             # 仅本地文件支持全速分析
             fs = want_fullspeed and kind == 'file'
             pb = PlaybackThread(kind, src, self.disp_q, self.det_q, self.stop_event,
                                 self.pause_event, si - 1, total_src,
-                                self.params['pad'], speed=speed,
+                                self.params['pad'],
                                 detect_every=1 if fs else detect_every,
                                 tight_box=False if fs else tight_box,
                                 det_progress=det_progress,
@@ -1207,18 +1237,203 @@ class RunnerThread(threading.Thread):
 
 
 # ============================================================
-# PyQt5 主界面
+# PyQt6 主界面
 # ============================================================
+# ---------------- 扁平化 / 现代化配色（浅色主题） ----------------
+# 设计约定：
+#   * 页面底色略灰，内容区一律“白卡片 + 1px 极浅描边 + 10px 圆角”，不用重边框；
+#   * 强调色统一蓝色 #2563eb；成功/警告/危险色仅用于按钮与关键数值；
+#   * 控件高度、圆角、内边距统一，避免“高矮胖瘦混排”。
+C_BG        = "#f4f6fa"   # 页面底色
+C_CARD      = "#ffffff"   # 卡片底色
+C_BORDER    = "#e5e9f0"   # 卡片描边
+C_BORDER_2  = "#dfe4ec"   # 输入控件描边
+C_TEXT      = "#1f2a37"   # 主文字
+C_TEXT_2    = "#6b7280"   # 次要文字
+C_TEXT_3    = "#94a3b8"   # 弱提示文字
+C_ACCENT    = "#2563eb"   # 强调蓝
+C_OK        = "#10b981"   # 成功绿
+C_WARN      = "#f59e0b"   # 警告橙
+C_DANGER    = "#ef4444"   # 危险红
+C_VIDEO_BG  = "#0b0f14"   # 视频区底色（保持深色，突出画面）
+
+APP_QSS = f"""
+* {{ outline: none; }}
+QMainWindow, QWidget#central {{ background: {C_BG}; }}
+
+/* ---------- 卡片式分组 ---------- */
+QGroupBox {{
+    background: {C_CARD};
+    border: 1px solid {C_BORDER};
+    border-radius: 10px;
+    margin-top: 13px;
+    padding: 14px 14px 12px 14px;
+    font-size: 10.5pt;
+    font-weight: 600;
+    color: {C_TEXT};
+}}
+QGroupBox::title {{
+    subcontrol-origin: margin;
+    subcontrol-position: top left;
+    left: 13px;
+    padding: 0 6px;
+    color: {C_ACCENT};
+}}
+
+/* ---------- 文字 ---------- */
+QLabel {{ color: {C_TEXT}; background: transparent; }}
+QLabel#hint  {{ color: {C_TEXT_3}; font-size: 9pt; }}
+QLabel#sub   {{ color: {C_TEXT_2}; font-size: 9pt; }}
+QLabel#infoV {{ color: {C_TEXT};   font-size: 10.5pt; }}
+QLabel#fps   {{ color: {C_OK};     font-size: 10.5pt; font-weight: 700; }}
+QLabel#status{{ color: {C_TEXT_2}; font-size: 10pt; }}
+QLabel#faceThumb {{
+    background: #f8fafc;
+    border: 1px dashed #cbd5e1;
+    border-radius: 10px;
+    color: {C_TEXT_3};
+    font-size: 9pt;
+}}
+
+/* ---------- 按钮：统一扁平外观 ---------- */
+QPushButton {{
+    background: {C_CARD};
+    color: #334155;
+    border: 1px solid {C_BORDER_2};
+    border-radius: 8px;
+    padding: 7px 16px;
+    font-size: 10pt;
+    min-height: 18px;
+}}
+QPushButton:hover    {{ background: #f1f5f9; border-color: #cbd5e1; }}
+QPushButton:pressed  {{ background: #e8eef6; }}
+QPushButton:disabled {{ color: #a8b3c1; background: #f7f9fc; border-color: #eaeef5; }}
+
+QPushButton#primaryBtn, QPushButton#warnBtn, QPushButton#dangerBtn {{
+    color: #ffffff; font-weight: 600; border: none; padding: 9px 26px;
+}}
+QPushButton#primaryBtn {{ background: {C_ACCENT}; }}
+QPushButton#primaryBtn:hover {{ background: #1d4ed8; }}
+QPushButton#primaryBtn:disabled {{ background: #dfe6f3; color: #9aa8bd; }}
+QPushButton#warnBtn {{ background: {C_WARN}; }}
+QPushButton#warnBtn:hover {{ background: #d97706; }}
+QPushButton#warnBtn:disabled {{ background: #f6e8d0; color: #b3a184; }}
+QPushButton#dangerBtn {{ background: {C_DANGER}; }}
+QPushButton#dangerBtn:hover {{ background: #dc2626; }}
+QPushButton#dangerBtn:disabled {{ background: #f6dede; color: #b99a9a; }}
+
+/* ---------- 输入类控件 ---------- */
+QLineEdit, QSpinBox, QDoubleSpinBox, QTextEdit, QListWidget {{
+    background: {C_CARD};
+    border: 1px solid {C_BORDER_2};
+    border-radius: 8px;
+    padding: 5px 9px;
+    color: {C_TEXT};
+    selection-background-color: {C_ACCENT};
+    selection-color: #ffffff;
+}}
+QLineEdit:focus, QSpinBox:focus, QDoubleSpinBox:focus, QTextEdit:focus {{
+    border: 1px solid {C_ACCENT};
+}}
+QLineEdit:disabled, QSpinBox:disabled, QDoubleSpinBox:disabled,
+QListWidget:disabled {{
+    background: #f7f9fc; color: #a8b3c1; border-color: #eaeef5;
+}}
+QListWidget::item {{ padding: 3px 6px; border-radius: 5px; }}
+QListWidget::item:selected {{ background: #e8f0fe; color: {C_ACCENT}; }}
+
+/* ---------- 单选 / 复选 ---------- */
+/* 注意：Qt 样式表里 ::indicator 的 width/height 指的是「内容盒」，边框会加在外面。
+   所以圆角半径必须按 (内容尺寸 + 2×边框宽) 的一半来给，否则会渲染成圆角方块
+   （单选按钮必须是正圆）。这里固定：单选 14+2×2=18 → r9。
+   复选框（FlatCheckBox）不走 QSS 的 ::indicator：它要画 √，
+   而 QSS 只能靠 image:url(...) 贴图（带资源文件 + 路径脆弱），故改由 paintEvent 自绘。 */
+QRadioButton, QCheckBox {{ color: #334155; font-size: 10pt; spacing: 7px; }}
+QRadioButton::indicator {{ width: 14px; height: 14px; }}
+QRadioButton::indicator {{
+    border: 2px solid #c3cbd8; border-radius: 9px; background: {C_CARD};
+}}
+QRadioButton::indicator:hover {{ border-color: #93a7c4; }}
+QRadioButton::indicator:checked {{
+    border: 2px solid {C_ACCENT};
+    /* 用径向渐变画「蓝环 + 实心蓝点」，避免改变边框宽度导致控件尺寸跳动 */
+    background: qradialgradient(cx:0.5, cy:0.5, radius:0.5, fx:0.5, fy:0.5,
+                stop:0 {C_ACCENT}, stop:0.42 {C_ACCENT},
+                stop:0.52 {C_CARD}, stop:1 {C_CARD});
+}}
+QRadioButton::indicator:disabled {{ border-color: #dfe4ec; }}
+
+/* ---------- 滑块 ---------- */
+QSlider::groove:horizontal {{
+    height: 6px; background: #e8ecf3; border-radius: 3px;
+}}
+QSlider::sub-page:horizontal {{ background: {C_ACCENT}; border-radius: 3px; }}
+QSlider::add-page:horizontal {{ background: #e8ecf3; border-radius: 3px; }}
+QSlider::handle:horizontal {{
+    width: 14px; height: 14px; margin: -5px 0;
+    border-radius: 9px; background: {C_CARD}; border: 2px solid {C_ACCENT};
+}}
+QSlider::handle:horizontal:hover {{ border-color: #1d4ed8; }}
+QSlider::groove:horizontal:disabled {{ background: #eef1f6; }}
+QSlider::sub-page:horizontal:disabled {{ background: #cdd6e4; }}
+QSlider::handle:horizontal:disabled {{
+    background: #f7f9fc; border-color: #c8d0dc;
+}}
+
+/* ---------- 进度条 ---------- */
+/* 进度百分比文字由 Qt 用 palette 文本色画在整条进度条上，会同时压在「已填充」与
+   「未填充」两段上。因此填充色取中浅蓝（#7ea6ee），保证深灰文字在两种底色上都清晰。 */
+QProgressBar {{
+    border: none; border-radius: 6px; background: #e8ecf3;
+    height: 12px; text-align: center; font-size: 9pt; color: #334155;
+}}
+QProgressBar::chunk {{ background: #7ea6ee; border-radius: 6px; }}
+
+/* ---------- 日志区 ---------- */
+QTextEdit#logText {{
+    background: #fbfcfe;
+    border: 1px solid {C_BORDER};
+    border-radius: 8px;
+    font-family: Consolas, "Cascadia Mono", "Microsoft YaHei UI", monospace;
+    font-size: 9pt;
+    color: #334155;
+}}
+
+/* ---------- 滚动条 ---------- */
+QScrollBar:vertical {{ background: transparent; width: 10px; margin: 2px; }}
+QScrollBar::handle:vertical {{
+    background: #cbd5e1; border-radius: 5px; min-height: 24px;
+}}
+QScrollBar::handle:vertical:hover {{ background: #a8b6c8; }}
+QScrollBar::add-line, QScrollBar::sub-line {{ height: 0; }}
+QScrollBar::add-page, QScrollBar::sub-page {{ background: transparent; }}
+QScrollBar:horizontal {{ background: transparent; height: 10px; margin: 2px; }}
+QScrollBar::handle:horizontal {{
+    background: #cbd5e1; border-radius: 5px; min-width: 24px;
+}}
+
+/* ---------- 提示气泡 / 弹窗 ---------- */
+QMessageBox {{ background: {C_CARD}; }}
+QMessageBox QLabel {{ color: {C_TEXT}; }}
+QToolTip {{
+    background: #1f2a37; color: #f8fafc; border: none;
+    border-radius: 6px; padding: 5px 8px;
+}}
+"""
+
+
 class VideoLabel(QLabel):
-    """保持 16:9 比例的视频显示区。"""
+    """保持 16:9 比例的视频显示区（深色底，圆角扁平）。"""
 
     def __init__(self):
         super().__init__()
-        self.setAlignment(Qt.AlignCenter)
+        self.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.setMinimumSize(480, 270)
         self.setStyleSheet(
-            "QLabel{background:#0e1116;color:#9fb3c8;border:1px solid #2a3340;"
-            "border-radius:10px;font-size:13px;}")
+            f"QLabel{{background:{C_VIDEO_BG};color:#7f93a8;"
+            "border:1px solid #1b2430;border-radius:10px;font-size:10pt;}}")
+        self.setSizePolicy(QSizePolicy.Policy.Expanding,
+                           QSizePolicy.Policy.Expanding)
 
     def hasHeightForWidth(self):
         return True
@@ -1227,10 +1442,175 @@ class VideoLabel(QLabel):
         return int(w * 9.0 / 16.0)
 
 
+class FaceThumb(QLabel):
+    """目标人脸预览（竖版 3:4 友好）：随容器自适应放大，保持原图比例不裁剪。
+
+    V1.3：日志栏移到底部后，左列纵向空间全部给到本控件，因此不再用固定尺寸，
+    而是保留原始 QPixmap 并在每次尺寸变化时平滑重缩放，充分吃满可用空间。
+    """
+
+    def __init__(self):
+        super().__init__()
+        self.setObjectName("faceThumb")
+        self.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.setMinimumSize(210, 275)   # 3:4 下限
+        self.setSizePolicy(QSizePolicy.Policy.Expanding,
+                           QSizePolicy.Policy.Expanding)
+        self.setText("（未选择）")
+        self._src = None                # 原图 QPixmap（未缩放）
+        self._refitting = False
+
+    def set_source(self, pix):
+        """设置原图；传 None 表示清空。"""
+        self._src = pix
+        if pix is None or pix.isNull():
+            self._src = None
+            self.setPixmap(QPixmap())
+            return
+        self.setText("")
+        self._refit()
+
+    def clear_source(self):
+        self._src = None
+        self.setPixmap(QPixmap())
+
+    def resizeEvent(self, ev):
+        super().resizeEvent(ev)
+        self._refit()
+
+    def _refit(self):
+        if self._src is None or self._refitting:
+            return
+        tw = max(1, self.width() - 10)
+        th = max(1, self.height() - 10)
+        if tw <= 2 or th <= 2:
+            return
+        self._refitting = True
+        try:
+            self.setPixmap(self._src.scaled(
+                tw, th,
+                Qt.AspectRatioMode.KeepAspectRatio,
+                Qt.TransformationMode.SmoothTransformation))
+        finally:
+            self._refitting = False
+
+
+class FlatCheckBox(QCheckBox):
+    """扁平复选框：自绘方框，选中时画白色对勾（√）。
+
+    为什么不用 QSS 的 `QCheckBox::indicator { image: url(...) }`：
+      * 需要额外提交一张 png 资源进仓库；且 QSS 里的相对路径是按**进程工作目录**解析的，
+        「双击 launch.bat」与「从别处启动」结果不同，很脆；
+      * 用纯色方块代替对勾虽然简单，但用户明确要求勾选态显示 √。
+    自绘没有资源依赖，颜色随全局主题常量走，对勾的线宽/圆头/圆角都能精确控制。
+    方框总尺寸与其它扁平控件统一：18x18 + 2px 边框 + 4px 圆角。
+    """
+
+    BOX = 18        # 方框外沿边长（含边框）
+    BORDER = 2      # 边框线宽
+    RADIUS = 4      # 圆角
+    GAP = 8         # 方框与文字的间距
+
+    # 未选中 / 悬停 / 选中 的（填充色, 边框色）
+    _OFF = (C_CARD, "#c3cbd8")
+    _HOVER = (C_CARD, "#93a7c4")
+    _ON = (C_ACCENT, C_ACCENT)
+    _DISABLED = ("#f7f9fc", "#dfe4ec")
+
+    _warned = False   # 自绘异常只提示一次（见 paintEvent），避免刷屏
+
+    def __init__(self, text="", parent=None):
+        super().__init__(text, parent)
+        # 自绘时 QSS 的 :hover 不生效，需要开启 hover 属性才能收到重绘
+        self.setAttribute(Qt.WidgetAttribute.WA_Hover, True)
+
+    def sizeHint(self):
+        fm = self.fontMetrics()
+        w = self.BOX + self.GAP + fm.horizontalAdvance(self.text()) + 2
+        h = max(self.BOX + 4, fm.height() + 4)
+        return QSize(w, h)
+
+    def minimumSizeHint(self):
+        return self.sizeHint()
+
+    def paintEvent(self, event):
+        p = QPainter(self)
+        try:
+            p.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+            fm = self.fontMetrics()
+            on = self.isChecked()
+            en = self.isEnabled()
+
+            if not en:
+                fill, border = self._DISABLED
+            elif on:
+                fill, border = self._ON
+            elif self.underMouse():
+                fill, border = self._HOVER
+            else:
+                fill, border = self._OFF
+
+            # ---- 方框（垂直居中） ----
+            box = QRect(1, (self.height() - self.BOX) // 2, self.BOX, self.BOX)
+            p.setPen(QPen(QColor(border), self.BORDER))
+            p.setBrush(QColor(fill))
+            # QPen 以线中线绘制，内缩半个线宽，方框外沿才正好落在 BOX 边界内。
+            # 注意：必须用 QRectF —— PyQt6 的 QRect.adjusted() 只接受 int，
+            # 传 float（BORDER/2.0）会抛 TypeError（PyQt5 宽容，迁移时踩过）。
+            half = self.BORDER / 2.0
+            p.drawRoundedRect(QRectF(box).adjusted(half, half, -half, -half),
+                              float(self.RADIUS), float(self.RADIUS))
+
+            # ---- 对勾 √（相对方框按比例取点，换尺寸也不会走形） ----
+            if on and en:
+                s = float(self.BOX)
+                x0, y0 = float(box.left()), float(box.top())
+                p.setBrush(Qt.BrushStyle.NoBrush)
+                p.setPen(QPen(QColor("#ffffff"), 2.2,
+                              Qt.PenStyle.SolidLine,
+                              Qt.PenCapStyle.RoundCap,
+                              Qt.PenJoinStyle.RoundJoin))
+                path = QPainterPath()
+                path.moveTo(x0 + 0.26 * s, y0 + 0.52 * s)
+                path.lineTo(x0 + 0.44 * s, y0 + 0.70 * s)
+                path.lineTo(x0 + 0.76 * s, y0 + 0.30 * s)
+                p.drawPath(path)
+
+            # ---- 文字 ----
+            tx = self.BOX + self.GAP
+            p.setPen(QColor("#334155" if en else "#a8b3c1"))
+            p.drawText(QRect(tx, 0, max(1, self.width() - tx), self.height()),
+                       Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft,
+                       self.text())
+        except Exception:
+            # 绘制异常不能冒泡：Qt 槽/事件内未捕获异常会走 qFatal 直接崩进程。
+            # 但也绝不能静默 —— V1.3 首次实现时正因这里吞掉 TypeError，
+            # 勾选框整块「消失」却毫无提示。首次失败打到 stderr，便于排查。
+            if not FlatCheckBox._warned:
+                FlatCheckBox._warned = True
+                import traceback
+                traceback.print_exc()
+        finally:
+            p.end()
+
+
+def _widen_spin_by_50(spin):
+    """把数值框的宽度按当前 sizeHint 加宽 50%。
+
+    为什么需要：QSpinBox / QDoubleSpinBox 的默认宽度由 style 按「数字 + 上下箭头」
+    算出来，带中文后缀（如「秒」）时放不下 —— 后缀会被右边缘裁掉，只剩半个字。
+    加宽 50% 既够显示又不过分占位。
+
+    必须在 setRange / setSuffix 之后再调用：sizeHint 依赖这些属性，
+    提前调用拿到的是加后缀前的旧值。
+    """
+    spin.setMinimumWidth(int(spin.sizeHint().width() * 1.5))
+
+
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("视频人脸检测比对工具V1.2_by_huyin")
+        self.setWindowTitle("视频人脸检测比对工具V1.3_by_huyin")
         # 工具图标（优先使用打包进 exe 的 icon.png；未打包时回退 icon.svg）
         _icon_path = None
         if getattr(sys, "frozen", False) and hasattr(sys, "_MEIPASS"):
@@ -1241,12 +1621,15 @@ class MainWindow(QMainWindow):
             _icon_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "icon.svg")
         if os.path.exists(_icon_path):
             self.setWindowIcon(QIcon(_icon_path))
-        # 默认窗口大小：日志移入左列后整体更高（视频列随之更高），适当加高
-        self.resize(1300, 1060)
-        self.setMinimumSize(1160, 860)
+        # 默认窗口大小：日志栏通栏置于底部（可显示约 8 行文字），中部左列纵向空间
+        # 全部让给「目标人脸」栏。因为日志变高，整体高度比 V1.3 初版加高 60px，
+        # 以保住目标人脸预览的尺寸（窗口拉高时多出的空间也归它）。
+        self.resize(1340, 1080)
+        self.setMinimumSize(1180, 900)
 
         # 运行状态
         self.face_path = ""
+        self._face_pix = None          # 目标人脸原图 QPixmap（供自适应重缩放）
         self.mode = 'compare'          # 'compare' | 'detect'
         self.source_kind = 'file'      # 'file' | 'rtsp'
         self.analyze_mode = 'realtime'  # 'realtime' | 'fullspeed'（全速仅本地视频可用）
@@ -1272,8 +1655,6 @@ class MainWindow(QMainWindow):
         self._last_fps = 0.0       # 最近一次上报的分析帧率（用于完成时汇总）
         self.runner = None
         self.out = ""
-        self.speed_val = 1
-        self.speed_steps = [1, 2, 4, 8, 16]
 
         self.providers, self.use_gpu, self.gpu_name, self.note = detect_runtime()
 
@@ -1283,35 +1664,47 @@ class MainWindow(QMainWindow):
         self._timer.timeout.connect(self._poll)
         self._timer.start(16)  # ~60fps 轮询：降低“读取→显示”延迟，播放与目标框更跟手
 
-        self._append_log("视频人脸检测比对工具 V1.2 启动")
+        self._append_log("视频人脸检测比对工具 V1.3 启动")
         self._append_log(f"运行环境：{'GPU (CUDA)' if self.use_gpu else 'CPU'}")
         self._append_log(self.note)
 
     # ---------------- UI 构建 ----------------
-    def _group(self, title):
+    @staticmethod
+    def _group(title):
+        """创建一张卡片式分组框（外观全部由全局 QSS 控制，保持视觉统一）。"""
         g = QGroupBox(title)
-        g.setStyleSheet(
-            "QGroupBox{font-weight:600;font-size:11pt;color:#1f2d3d;"
-            "border:1px solid #d7dee8;border-radius:8px;margin-top:10px;}"
-            "QGroupBox::title{subcontrol-origin:margin;left:12px;padding:0 4px;background:#f5f8fc;}")
         lay = QVBoxLayout(g)
-        lay.setSpacing(6)
-        lay.setContentsMargins(12, 14, 12, 10)
+        lay.setSpacing(7)
+        lay.setContentsMargins(0, 0, 0, 0)
         return g
+
+    @staticmethod
+    def _hint(text, tip=None, wrap=True):
+        """弱提示文字（灰色小字）。"""
+        lb = QLabel(text)
+        lb.setObjectName("hint")
+        lb.setWordWrap(wrap)
+        if tip:
+            lb.setToolTip(tip)
+        return lb
 
     def _build_ui(self):
         central = QWidget()
+        central.setObjectName("central")
         self.setCentralWidget(central)
         root = QVBoxLayout(central)
-        root.setSpacing(8)
-        root.setContentsMargins(10, 10, 10, 10)
+        root.setSpacing(12)
+        root.setContentsMargins(14, 14, 14, 12)
 
-        # ===== 顶部：视频源（RTSP / 本地视频 二选一）+ 输出目录 =====
+        # ===== 顶部：视频源（RTSP / 本地视频 二选一）+ 输出目录  |  参数设置 =====
         top = QHBoxLayout()
-        top.setSpacing(10)
+        top.setSpacing(12)
 
-        # --- 左：视频源 + 输出目录 ---
+        # --- 左：视频源 + 输出目录（合并为一张卡片：左列原本比右侧参数卡矮，
+        #         合并后不增加顶部高度，却省下整张「输出目录」卡片的纵向占用，
+        #         腾出的空间全部让给中部「目标人脸」栏） ---
         left_top = QVBoxLayout()
+        left_top.setSpacing(12)
 
         g_src = self._group("视频源（RTSP 实时流 / 本地视频 二选一，不可同时分析）")
         self.src_bg = QButtonGroup(self)
@@ -1324,18 +1717,24 @@ class MainWindow(QMainWindow):
             lambda c, k='file': self._on_source_toggle(k) if c else None)
         self.rb_rtsp.toggled.connect(
             lambda c, k='rtsp': self._on_source_toggle(k) if c else None)
-        g_src.layout().addWidget(self.rb_file)
-        g_src.layout().addWidget(self.rb_rtsp)
+        h_src = QHBoxLayout()
+        h_src.setSpacing(18)
+        h_src.addWidget(self.rb_file)
+        h_src.addWidget(self.rb_rtsp)
+        h_src.addStretch(1)
+        g_src.layout().addLayout(h_src)
         # RTSP 地址
         self.rtsp_url = QLineEdit()
         self.rtsp_url.setPlaceholderText("rtsp://user:pass@ip:port/stream")
         g_src.layout().addWidget(self.rtsp_url)
         # 视频文件列表
         self.video_list = QListWidget()
-        self.video_list.setSelectionMode(QAbstractItemView.ExtendedSelection)
-        self.video_list.setMaximumHeight(120)
+        self.video_list.setSelectionMode(
+            QAbstractItemView.SelectionMode.ExtendedSelection)
+        self.video_list.setMaximumHeight(80)
         g_src.layout().addWidget(self.video_list)
         row = QHBoxLayout()
+        row.setSpacing(8)
         self.btn_add_video = QPushButton("添加视频")
         self.btn_remove_video = QPushButton("移除")
         self.btn_clear_video = QPushButton("清空")
@@ -1345,12 +1744,12 @@ class MainWindow(QMainWindow):
         row.addWidget(self.btn_add_video)
         row.addWidget(self.btn_remove_video)
         row.addWidget(self.btn_clear_video)
+        row.addStretch(1)
         g_src.layout().addLayout(row)
-        left_top.addWidget(g_src)
-
-        # 输出目录
-        g_out = self._group("输出目录")
+        # 输出目录（与视频源同卡片，压缩纵向行数）
         h_out = QHBoxLayout()
+        h_out.setSpacing(8)
+        h_out.addWidget(QLabel("输出目录："))
         self.out_dir = QLineEdit(os.path.join(os.getcwd(), "输出结果"))
         h_out.addWidget(self.out_dir, 1)
         self.btn_browse_out = QPushButton("浏览")
@@ -1359,15 +1758,18 @@ class MainWindow(QMainWindow):
         self.btn_open_out.clicked.connect(self._open_out)
         h_out.addWidget(self.btn_browse_out)
         h_out.addWidget(self.btn_open_out)
-        g_out.layout().addLayout(h_out)
-        left_top.addWidget(g_out)
-        top.addLayout(left_top, 2)
+        g_src.layout().addLayout(h_out)
+        left_top.addWidget(g_src)
+        left_top.addStretch(1)
+        top.addLayout(left_top, 1)
 
         # --- 右：参数设置（运行模式为第一排） ---
         right_top = QVBoxLayout()
+        right_top.setSpacing(0)
         g_param = self._group("参数设置")
         # 第一排：运行模式二选一
         h_mode = QHBoxLayout()
+        h_mode.setSpacing(16)
         h_mode.addWidget(QLabel("运行模式："))
         self.mode_bg = QButtonGroup(self)
         self.rb_compare = QRadioButton("人脸识别比对模式")
@@ -1386,8 +1788,9 @@ class MainWindow(QMainWindow):
 
         # 相似度阈值（仅比对模式可调）
         h1 = QHBoxLayout()
+        h1.setSpacing(8)
         h1.addWidget(QLabel("相似度阈值(%)："))
-        self.sim_slider = QSlider(Qt.Horizontal)
+        self.sim_slider = QSlider(Qt.Orientation.Horizontal)
         self.sim_slider.setRange(10, 100)
         self.sim_slider.setValue(70)
         self.sim_slider.valueChanged.connect(
@@ -1399,8 +1802,9 @@ class MainWindow(QMainWindow):
         g_param.layout().addLayout(h1)
         # 人脸质量阈值
         h2 = QHBoxLayout()
+        h2.setSpacing(8)
         h2.addWidget(QLabel("人脸质量阈值："))
-        self.quality_slider = QSlider(Qt.Horizontal)
+        self.quality_slider = QSlider(Qt.Orientation.Horizontal)
         self.quality_slider.setRange(10, 80)
         self.quality_slider.setValue(70)
         self.quality_slider.valueChanged.connect(
@@ -1410,90 +1814,99 @@ class MainWindow(QMainWindow):
         self.quality_val_label.setFixedWidth(42)
         h2.addWidget(self.quality_val_label)
         g_param.layout().addLayout(h2)
-        g_param.layout().addWidget(QLabel(
-            "（低于该质量分的人脸不做比对/抓图：光线暗/像素低/模糊/角度偏/光比大）"))
-        # 人脸优选（取代原“截图间隔秒数”）
-        self.chk_prefer = QCheckBox("人脸优选（在优选时长内仅保留人脸质量最高的一帧）")
+        g_param.layout().addWidget(self._hint(
+            "低于该质量分的人脸不做比对/抓图（光线暗 / 像素低 / 模糊 / 角度偏 / 光比大）"))
+        # 人脸优选（取代原“截图间隔秒数”）：开关与时长同排，压缩纵向行数，
+        # 把腾出的高度留给「目标人脸」栏（V1.3 布局要求）。
+        h_pref = QHBoxLayout()
+        h_pref.setSpacing(10)
+        self.chk_prefer = FlatCheckBox("人脸优选（窗口内仅保留质量最高的一帧）")
         self.chk_prefer.setChecked(True)
         self.chk_prefer.toggled.connect(self._on_prefer_toggle)
-        g_param.layout().addWidget(self.chk_prefer)
-        h4 = QHBoxLayout()
-        h4.addWidget(QLabel("人脸优选时长："))
+        h_pref.addWidget(self.chk_prefer)
+        h_pref.addStretch(1)
+        h_pref.addWidget(QLabel("优选时长："))
         self.prefer_spin = QDoubleSpinBox()
         self.prefer_spin.setRange(0.5, 30.0)
         self.prefer_spin.setSingleStep(0.5)
         self.prefer_spin.setValue(3.0)
         self.prefer_spin.setSuffix(" 秒")
-        h4.addWidget(self.prefer_spin)
-        h4.addStretch(1)
-        g_param.layout().addLayout(h4)
-        g_param.layout().addWidget(QLabel(
-            "未启用人脸优选时，人脸质量达阈值即截。"))
+        _widen_spin_by_50(self.prefer_spin)
+        h_pref.addWidget(self.prefer_spin)
+        g_param.layout().addLayout(h_pref)
         # 实时性平衡滑块：左=视频流畅优先，右=人脸检测实时优先
         h_bal = QHBoxLayout()
+        h_bal.setSpacing(8)
         h_bal.addWidget(QLabel("流畅性 ◀"))
-        self.balance_slider = QSlider(Qt.Horizontal)
+        self.balance_slider = QSlider(Qt.Orientation.Horizontal)
         self.balance_slider.setRange(0, 100)
         # 默认 75（逐帧检测）：检测提速后逐帧检测已不拖慢播放，
         # 直接给到“目标框紧贴人脸”的档位作为开箱默认值。
         self.balance_slider.setValue(75)
+        self.balance_slider.setToolTip(
+            "已优化检测速度，默认即可逐帧检测：视频流畅与目标框实时可同时满足；\n"
+            "偏左可降低显卡占用（框靠运动补偿跟踪补齐）。")
         self.balance_slider.valueChanged.connect(self._on_balance)
         h_bal.addWidget(self.balance_slider, 1)
         h_bal.addWidget(QLabel("▶ 检测实时"))
         self.balance_val_label = QLabel("检测")
-        self.balance_val_label.setFixedWidth(42)
+        self.balance_val_label.setFixedWidth(48)
         h_bal.addWidget(self.balance_val_label)
         g_param.layout().addLayout(h_bal)
-        g_param.layout().addWidget(QLabel(
-            "（已优化检测速度，默认即可逐帧检测：视频流畅与目标框实时可同时满足；"
-            "偏左可降低显卡占用）"))
-        # 截取视频开关（默认关闭）
-        self.chk_segment = QCheckBox("启用截取视频（保存命中前后的视频片段）")
+        # 关联视频（默认关闭）：开关与前后时长同排
+        h_seg = QHBoxLayout()
+        h_seg.setSpacing(10)
+        self.chk_segment = FlatCheckBox("关联视频")
+        self.chk_segment.setToolTip(
+            "勾选后，命中时刻向前/向后各「前后时长」秒会拼成一个完整出场片段，"
+            "随截图一并保存为 mp4。")
         self.chk_segment.setChecked(False)
         self.chk_segment.toggled.connect(self._on_segment_toggle)
-        g_param.layout().addWidget(self.chk_segment)
-        # 截取视频前后时长（仅启用截取视频时可设置；默认关闭 -> 禁用）
-        h_pad = QHBoxLayout()
-        h_pad.addWidget(QLabel("截取视频前后时长："))
+        h_seg.addWidget(self.chk_segment)
+        h_seg.addStretch(1)
+        h_seg.addWidget(QLabel("前后时长："))
         self.pad_spin = QSpinBox()
         self.pad_spin.setRange(0, 120)
         self.pad_spin.setValue(10)
         self.pad_spin.setSuffix(" 秒")
-        h_pad.addWidget(self.pad_spin)
-        h_pad.addStretch(1)
-        g_param.layout().addLayout(h_pad)
-        g_param.layout().addWidget(QLabel(
-            "（命中时刻向前/向后各保留该时长，拼接成完整的出场片段）"))
+        _widen_spin_by_50(self.pad_spin)
+        h_seg.addWidget(self.pad_spin)
+        g_param.layout().addLayout(h_seg)
+        # 全部说明合并成一行，避免每项各占一行把卡片撑高
+        self._param_hint = self._hint(
+            "说明：未启用人脸优选时，人脸质量达阈值即截；关联视频会保存命中时刻"
+            "向前/向后各「前后时长」秒拼接成的完整出场片段。")
+        g_param.layout().addWidget(self._param_hint)
         self._on_segment_toggle(False)  # 初始化：未启用 -> 禁用时长控件
         right_top.addWidget(g_param)
         right_top.addStretch(1)
         top.addLayout(right_top, 1)
         root.addLayout(top)
 
-        # ===== 中部：左(1/4 目标人脸+实时信息) 右(3/4 视频) =====
-        # ===== 下方：左(1/4 目标人脸 + 实时信息 + 日志) 右(3/4 实时视频) =====
-        # 左列宽度与“实时信息”栏一致；日志置于左列底部（宽度随之收窄），
-        # 原全宽日志腾出的横向空间全部让给右侧视频板块。
+        # ===== 中部：左(1/4 目标人脸 + 实时信息) 右(3/4 实时视频) =====
+        # V1.3：日志栏已移至界面最底部通栏，左列腾出的纵向空间全部给「目标人脸」栏
+        # （人脸预览自适应放大，卡面随窗口拉高）。
         lower = QHBoxLayout()
-        lower.setSpacing(10)
+        lower.setSpacing(12)
 
-        # --- 左 1/4：目标人脸 + 实时信息 + 日志（日志宽度=本列宽度） ---
+        # --- 左 1/4：目标人脸（吃满纵向空间）+ 实时信息 ---
         left_col = QVBoxLayout()
+        left_col.setSpacing(12)
         g_face = self._group("目标人脸")
         self.btn_select_face = QPushButton("选择目标人脸图片")
         self.btn_select_face.clicked.connect(self._select_face)
         g_face.layout().addWidget(self.btn_select_face)
-        self.face_thumb = QLabel("（未选择）")
-        self.face_thumb.setAlignment(Qt.AlignCenter)
-        self.face_thumb.setFixedSize(195, 260)  # 纵向 3:4（宽:高），完整显示竖版人脸照
-        self.face_thumb.setStyleSheet("QLabel{background:#f0f3f8;border:1px dashed #c2ccd9;"
-                                      "border-radius:8px;color:#8a97a8;font-size:11px;}")
-        g_face.layout().addWidget(self.face_thumb, 0, Qt.AlignHCenter)
+        # 竖版 3:4 预览：不再固定尺寸，随窗口自适应；原图比例不裁剪
+        self.face_thumb = FaceThumb()
+        g_face.layout().addWidget(self.face_thumb, 1)
         self.face_path_label = QLabel("")
-        self.face_path_label.setStyleSheet("color:#64748b;font-size:10px;")
-        self.face_path_label.setWordWrap(True)
+        self.face_path_label.setObjectName("sub")
+        # 只显示文件名、完整路径放 tooltip：长路径若折成两行会白白吃掉
+        # 「目标人脸」栏的纵向空间（从而压缩人脸预览），这里强制单行。
+        self.face_path_label.setWordWrap(False)
         g_face.layout().addWidget(self.face_path_label)
-        left_col.addWidget(g_face)
+        left_col.addWidget(g_face, 1)
+
         g_info = self._group("实时信息")
         self.sim_val = QLabel("当前相似度：--")
         self.match_val = QLabel("比对结果：未匹配")
@@ -1502,32 +1915,34 @@ class MainWindow(QMainWindow):
         self.shot_val = QLabel("截图：0")
         for w in (self.sim_val, self.match_val, self.facecount_val,
                   self.episode_val, self.shot_val):
-            w.setStyleSheet("font-size:13px;color:#1f2d3d;padding:1px 0;")
-            g_info.layout().addWidget(w)
-        left_col.addWidget(g_info)
-        left_col.addStretch(1)
-        # 日志：宽度与“实时信息”栏一致（不再全宽），置于左列底部
-        g_log = self._group("日志")
-        self.log_text = QTextEdit()
-        self.log_text.setReadOnly(True)
-        self.log_text.setMinimumHeight(300)
-        self.log_text.setMaximumHeight(460)
-        self.log_text.setStyleSheet("QTextEdit{background:#fbfcfe;border:1px solid #d7dee8;"
-                                    "border-radius:6px;font-size:11px;}")
-        g_log.layout().addWidget(self.log_text)
-        left_col.addWidget(g_log)
+            w.setObjectName("infoV")
+        # 两列三行排布（原为 5 行单列）：省下约 45px 纵向空间给上方「目标人脸」栏
+        grid = QGridLayout()
+        grid.setHorizontalSpacing(14)
+        grid.setVerticalSpacing(5)
+        grid.addWidget(self.sim_val, 0, 0)
+        grid.addWidget(self.facecount_val, 0, 1)
+        grid.addWidget(self.match_val, 1, 0)
+        grid.addWidget(self.episode_val, 1, 1)
+        grid.addWidget(self.shot_val, 2, 0)
+        grid.setColumnStretch(0, 1)
+        grid.setColumnStretch(1, 1)
+        g_info.layout().addLayout(grid)
+        left_col.addWidget(g_info, 0)
         lower.addLayout(left_col, 1)
 
-        # --- 右 3/4（带标题与框线）：实时视频 + 操作按钮（置于视频板块底部） ---
+        # --- 右 3/4：实时视频 + 分析模式 + 状态/进度 + 操作按钮 ---
         right_col = QVBoxLayout()
+        right_col.setSpacing(0)
         g_video = self._group("实时视频")
         self.video_label = VideoLabel()
         self.video_label.setText("未开始分析\n点击「开始」后此处实时显示画面")
         g_video.layout().addWidget(self.video_label, 1)
 
         # 分析模式（V1.2）：本地视频可选「实时分析 / 全速分析」；RTSP 仅支持实时分析。
-        # 同一行右侧显示当前分析帧率（帧/s）。
+        # 同一行右侧显示当前分析帧率（帧/s）。V1.3 起本行不再有「播放倍速」滑块。
         h_an = QHBoxLayout()
+        h_an.setSpacing(16)
         h_an.addWidget(QLabel("分析模式："))
         self.an_mode_bg = QButtonGroup(self)
         self.rb_realtime = QRadioButton("实时分析")
@@ -1538,61 +1953,38 @@ class MainWindow(QMainWindow):
         for rb in (self.rb_realtime, self.rb_fullspeed):
             h_an.addWidget(rb)
         self.an_mode_hint = QLabel("")
-        self.an_mode_hint.setStyleSheet("color:#94a3b8;font-size:10px;")
+        self.an_mode_hint.setObjectName("hint")
         h_an.addWidget(self.an_mode_hint)
         h_an.addStretch(1)
         self.fps_label = QLabel("分析帧率：-- 帧/s")
-        self.fps_label.setStyleSheet("color:#0f766e;font-size:13px;font-weight:600;")
+        self.fps_label.setObjectName("fps")
         h_an.addWidget(self.fps_label)
         g_video.layout().addLayout(h_an)
 
-        # 倍速滑块
-        h_speed = QHBoxLayout()
-        h_speed.addWidget(QLabel("播放倍速："))
-        self.speed_slider = QSlider(Qt.Horizontal)
-        self.speed_slider.setRange(0, len(self.speed_steps) - 1)
-        self.speed_slider.setValue(0)
-        self.speed_slider.setEnabled(False)  # 初始禁用；运行后按「源+分析模式」启用
-        self.speed_slider.valueChanged.connect(self._on_speed)
-        h_speed.addWidget(self.speed_slider, 1)
-        self.speed_label = QLabel("1X")
-        self.speed_label.setFixedWidth(40)
-        h_speed.addWidget(self.speed_label)
-        g_video.layout().addLayout(h_speed)
-
         self.status_label = QLabel("状态：就绪")
-        self.status_label.setStyleSheet("color:#475569;font-size:13px;")
+        self.status_label.setObjectName("status")
         g_video.layout().addWidget(self.status_label)
 
         self.progress = QProgressBar()
         self.progress.setRange(0, 100)
         self.progress.setValue(0)
         self.progress.setTextVisible(True)
-        self.progress.setStyleSheet(
-            "QProgressBar{border:1px solid #cdd6e0;border-radius:6px;height:16px;"
-            "background:#eef2f7;text-align:center;font-size:10px;}"
-            "QProgressBar::chunk{background:#3b82f6;border-radius:5px;}")
         g_video.layout().addWidget(self.progress)
 
-        # 操作按钮：开始 / 暂停 / 结束（移动到视频板块底部）
+        # 操作按钮：开始 / 暂停 / 结束
         btn_row = QHBoxLayout()
+        btn_row.setSpacing(12)
         self.btn_start = QPushButton("开始")
         self.btn_pause = QPushButton("暂停")
         self.btn_end = QPushButton("结束")
+        self.btn_start.setObjectName("primaryBtn")
+        self.btn_pause.setObjectName("warnBtn")
+        self.btn_end.setObjectName("dangerBtn")
         self.btn_pause.setEnabled(False)
         self.btn_end.setEnabled(False)
         self.btn_start.clicked.connect(self._start)
         self.btn_pause.clicked.connect(self._toggle_pause)
         self.btn_end.clicked.connect(self._stop)
-        self.btn_start.setStyleSheet(
-            "QPushButton{background:#3b82f6;color:#fff;font-weight:600;"
-            "border-radius:8px;padding:8px 14px;}")
-        self.btn_pause.setStyleSheet(
-            "QPushButton{background:#f59e0b;color:#fff;font-weight:600;"
-            "border-radius:8px;padding:8px 14px;}")
-        self.btn_end.setStyleSheet(
-            "QPushButton{background:#ef4444;color:#fff;font-weight:600;"
-            "border-radius:8px;padding:8px 14px;}")
         btn_row.addStretch(1)
         btn_row.addWidget(self.btn_start)
         btn_row.addWidget(self.btn_pause)
@@ -1601,7 +1993,17 @@ class MainWindow(QMainWindow):
         g_video.layout().addLayout(btn_row)
         right_col.addWidget(g_video, 1)
         lower.addLayout(right_col, 3)
-        root.addLayout(lower)
+        root.addLayout(lower, 1)
+
+        # ===== 底部：日志栏（V1.3 起改为通栏全宽，矮横条，不占用中部空间） =====
+        g_log = self._group("日志")
+        self.log_text = QTextEdit()
+        self.log_text.setObjectName("logText")
+        self.log_text.setReadOnly(True)
+        self.log_text.setMinimumHeight(168)
+        self.log_text.setMaximumHeight(200)
+        g_log.layout().addWidget(self.log_text)
+        root.addWidget(g_log, 0)
 
         # 初始化控件可用状态
         # 两个单选按钮都要接：切到「全速」时是 rb_fullspeed 变选中，
@@ -1619,15 +2021,20 @@ class MainWindow(QMainWindow):
             self.sim_slider.setEnabled(False)
             self.sim_val_label.setText("—")
             self.btn_select_face.setEnabled(False)
+            self.face_thumb.set_source(None)
             self.face_thumb.setText("（检测抓图模式：无需目标人脸）")
-            self.face_thumb.setPixmap(QPixmap())
             self.sim_val.setVisible(False)
             self.match_val.setVisible(False)
         else:
             self.sim_slider.setEnabled(True)
             self.sim_val_label.setText(f"{self.sim_slider.value()}%")
             self.btn_select_face.setEnabled(True)
-            self.face_thumb.setText("（未选择）")
+            # 若之前已选过有效人脸图，切回比对模式时直接恢复预览，不必重新选择
+            if self.face_path and os.path.isfile(self.face_path):
+                self._apply_face_thumb()
+            else:
+                self.face_thumb.set_source(None)
+                self.face_thumb.setText("（未选择）")
             self.sim_val.setVisible(True)
             self.match_val.setVisible(True)
 
@@ -1652,8 +2059,8 @@ class MainWindow(QMainWindow):
 
         规则：
           - 全速分析仅本地视频支持；切到 RTSP 时强制回到实时分析（并禁用全速选项）；
-          - 全速分析不按播放速度推进，故「播放倍速」与「实时性平衡」滑块均禁用；
-          - 播放倍速只在「本地视频 + 实时分析 + 运行中」三个条件同时满足时可用。
+          - 全速分析不按播放速度推进，故「实时性平衡」滑块禁用。
+        V1.3：播放倍速已取消，本函数不再管理倍速控件。
         """
         is_file = (self.source_kind == 'file')
 
@@ -1667,7 +2074,6 @@ class MainWindow(QMainWindow):
 
         full = (self.analyze_mode == 'fullspeed')
         self.rb_fullspeed.setEnabled(is_file)
-        self.speed_slider.setEnabled(is_file and (not full) and self.running)
         self.balance_slider.setEnabled(not full)
         if not is_file:
             self.an_mode_hint.setText("（RTSP 仅支持实时分析）")
@@ -1675,7 +2081,6 @@ class MainWindow(QMainWindow):
             self.an_mode_hint.setText("（不按播放速度，全算力逐帧分析）")
         else:
             self.an_mode_hint.setText("")
-        self.speed_label.setText("—" if full else f"{self.speed_val}X")
 
     def _on_analyze_mode(self, checked):
         """分析模式单选切换（运行中也可即时切换，播放线程每轮循环重读该标志）。"""
@@ -1708,19 +2113,27 @@ class MainWindow(QMainWindow):
             self, "选择目标人脸图片", "", "图片 (*.png *.jpg *.jpeg *.bmp)")
         if path:
             self.face_path = path
-            self.face_path_label.setText(path)
-            img = imread_utf8(path)
-            if img is not None:
-                rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
-                qimg = QImage(rgb.data, rgb.shape[1], rgb.shape[0],
-                              3 * rgb.shape[1], QImage.Format_RGB888).copy()
-                tw = max(1, self.face_thumb.width() - 10)
-                th = max(1, self.face_thumb.height() - 10)
-                pix = QPixmap.fromImage(qimg).scaled(
-                    QSize(tw, th),
-                    Qt.KeepAspectRatio, Qt.SmoothTransformation)
-                self.face_thumb.setPixmap(pix)
-                self.face_thumb.setText("")
+            self.face_path_label.setText(os.path.basename(path))
+            self.face_path_label.setToolTip(path)
+            self._apply_face_thumb()
+
+    def _apply_face_thumb(self):
+        """读取 self.face_path 并刷新目标人脸预览（原图存起来，交给控件自适应缩放）。
+
+        V1.3 性能：改用 QImage.Format_BGR888 直通，省掉一次全图 cvtColor。
+        缩放不再在这里做一次（控件本身会在尺寸变化时平滑重缩放），
+        这里只保留原始 QPixmap，避免重复插值导致的画质损失。
+        """
+        img = imread_utf8(self.face_path)
+        if img is None:
+            self.face_thumb.set_source(None)
+            self.face_thumb.setText("（图片读取失败）")
+            return
+        img = np.ascontiguousarray(img)  # QImage 需要连续内存
+        h, w = img.shape[:2]
+        qimg = QImage(img.data, w, h, 3 * w, QImage.Format.Format_BGR888).copy()
+        self._face_pix = QPixmap.fromImage(qimg)
+        self.face_thumb.set_source(self._face_pix)
 
     def _add_videos(self):
         paths, _ = QFileDialog.getOpenFileNames(
@@ -1745,14 +2158,6 @@ class MainWindow(QMainWindow):
         if d:
             self.out_dir.setText(d)
 
-    def _on_speed(self, idx):
-        self.speed_val = self.speed_steps[idx]
-        self.speed_label.setText(f"{self.speed_val}X")
-        # 仅本地视频分析时倍速生效；实时更新播放线程
-        if (self.runner is not None and self.runner._active_pb is not None
-                and self.source_kind == 'file'):
-            self.runner._active_pb.speed = self.speed_val
-
     @staticmethod
     def _detect_every_from_balance(balance):
         """实时性平衡 -> 检测采样间隔（每几帧送一帧给检测）。
@@ -1774,7 +2179,7 @@ class MainWindow(QMainWindow):
         self.prefer_spin.setEnabled(checked)
 
     def _on_segment_toggle(self, checked):
-        # 仅启用“截取视频”时才允许设置前后时长
+        # 仅勾选「关联视频」时才允许设置前后时长
         self.pad_spin.setEnabled(checked)
 
     def _open_out(self):
@@ -1851,7 +2256,6 @@ class MainWindow(QMainWindow):
             'pad': max(0.0, float(self.pad_spin.value())),
             'prefer_dur': max(0.5, float(self.prefer_spin.value())),
             'enable_prefer': self.chk_prefer.isChecked(),
-            'speed': self.speed_val,
             'balance': self.balance_slider.value(),
             'enable_segment': self.chk_segment.isChecked(),
             'analyze_mode': analyze_mode,
@@ -1867,7 +2271,7 @@ class MainWindow(QMainWindow):
         self.btn_pause.setEnabled(True)
         self.btn_pause.setText("暂停")
         self.btn_end.setEnabled(True)
-        # 倍速 / 平衡滑块的可用性由「源类型 + 分析模式 + 运行状态」统一决定
+        # 平衡滑块 / 全速选项的可用性由「源类型 + 分析模式 + 运行状态」统一决定
         self._refresh_ctrl_states()
 
         self.progress.setRange(0, 100)
@@ -1896,7 +2300,7 @@ class MainWindow(QMainWindow):
                          f"分析：{'全速（不按播放速度）' if analyze_mode == 'fullspeed' else '实时（按视频速度）'}  "
                          f"质量阈值：{params['quality_threshold']:.0f}" +
                          (f"  相似度阈值：{self.sim_slider.value()}%" if self.mode == 'compare' else "") +
-                         (f"  截取视频：{'开' if params['enable_segment'] else '关'}"))
+                         (f"  关联视频：{'开' if params['enable_segment'] else '关'}"))
         self.runner = RunnerThread(sources, self.face_path, out, params,
                                    self.providers, self.use_gpu, self.stop_event,
                                    self.pause_event, self.disp_q, self.det_q,
@@ -2118,8 +2522,9 @@ class MainWindow(QMainWindow):
                     else:  # lowq
                         label = f"{sim_to_label(tr['sim'])} 低质"
                         color = (130, 130, 130)
-                    disp = draw_box(disp, (x1, y1, x2, y2),
-                                    label=label, color=color)
+                    # V1.3：整帧只拷贝一次，多个人脸框逐个原地画（旧写法每框拷一次整帧）
+                    draw_box_inplace(disp, (x1, y1, x2, y2),
+                                     label=label, color=color)
                 self._set_pixmap(disp)
                 return
             except Exception:
@@ -2127,18 +2532,28 @@ class MainWindow(QMainWindow):
         self._set_pixmap(self._frame)
 
     def _set_pixmap(self, frame_bgr):
+        """把 BGR 帧送到预览区（显示管线热路径，每次刷新都会走到）。
+
+        V1.3 性能优化（实测每次刷新省下约 2.5~3ms，占全速分析单帧 UI 开销的大头）：
+          1. QImage.Format_BGR888 直通：省掉一次全图 cv2.cvtColor(BGR->RGB)
+             （1280x720 约 1.5ms）；
+          2. 去掉 QImage(...).copy()：QPixmap.fromImage 本身就会把像素拷进
+             Qt 的绘制后端，再 copy 一次纯属浪费（约 1MB 级 memcpy）；
+             只要本函数执行期间 frame_bgr 存活即安全（它由调用方持有）。
+        """
         try:
-            rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
-            rgb = np.ascontiguousarray(rgb)
-            h, w = rgb.shape[:2]
-            qimg = QImage(rgb.data, w, h, 3 * w, QImage.Format_RGB888).copy()
+            arr = np.ascontiguousarray(frame_bgr)  # 已是连续内存时零成本返回自身
+            h, w = arr.shape[:2]
+            qimg = QImage(arr.data, w, h, 3 * w,
+                          QImage.Format.Format_BGR888)
             pix = QPixmap.fromImage(qimg)
             # 播放线程已按显示尺寸预缩放，这里通常无需再缩放；
             # 仅当窗口尺寸变化导致不匹配时才兜底缩放一次。
             ls = self.video_label.size()
             if ls.width() > 0 and ls.height() > 0 and (
                     abs(ls.width() - w) > 2 or abs(ls.height() - h) > 2):
-                pix = pix.scaled(ls, Qt.KeepAspectRatio, Qt.SmoothTransformation)
+                pix = pix.scaled(ls, Qt.AspectRatioMode.KeepAspectRatio,
+                                 Qt.TransformationMode.SmoothTransformation)
             self.video_label.setPixmap(pix)
         except Exception:
             pass
@@ -2149,7 +2564,7 @@ class MainWindow(QMainWindow):
         self.btn_pause.setEnabled(False)
         self.btn_pause.setText("暂停")
         self.btn_end.setEnabled(False)
-        self._refresh_ctrl_states()  # 运行结束：收回倍速/平衡的操作权
+        self._refresh_ctrl_states()  # 运行结束：收回平衡滑块的操作权
         self._tracks = {}
         self._track_seq = 0
         self._set_status("完成")
@@ -2173,7 +2588,7 @@ class MainWindow(QMainWindow):
         self.btn_pause.setEnabled(False)
         self.btn_pause.setText("暂停")
         self.btn_end.setEnabled(False)
-        self._refresh_ctrl_states()  # 运行结束：收回倍速/平衡的操作权
+        self._refresh_ctrl_states()  # 运行结束：收回平衡滑块的操作权
         QMessageBox.critical(self, "运行错误", msg)
 
     def closeEvent(self, event):
@@ -2187,18 +2602,41 @@ class MainWindow(QMainWindow):
 # ============================================================
 # 入口
 # ============================================================
+def _pick_ui_font():
+    """挑选一个可用的中文界面字体（避免 Qt 默认字体在中文下显示为方框/过窄）。"""
+    try:
+        fams = set(QFontDatabase.families())
+        for name in ("Microsoft YaHei UI", "Microsoft YaHei",
+                     "HarmonyOS Sans SC", "PingFang SC", "Noto Sans CJK SC"):
+            if name in fams:
+                return QFont(name, 10)
+    except Exception:
+        pass
+    return QFont("Microsoft YaHei", 10)
+
+
 def main():
     if not PYQT_AVAILABLE:
-        print("错误：未安装 PyQt5，无法启动界面。请运行 launch.bat 安装依赖。", file=sys.stderr)
+        print("错误：未安装 PyQt6，无法启动界面。请运行 launch.bat 安装依赖。", file=sys.stderr)
         print(str(_QT_ERR), file=sys.stderr)
         sys.exit(1)
     if not (INSIGHTFACE_AVAILABLE and ORT_AVAILABLE and PIL_AVAILABLE):
         print("错误：缺少必要依赖 (insightface / onnxruntime / pillow)。", file=sys.stderr)
         sys.exit(1)
 
+    # 高分屏适配：必须在 QApplication 创建前设置（Qt6 默认已启用高 DPI 缩放，
+    # 这里只补上“按整数倍取整”的平滑策略，避免缩放过程出现半像素虚边）。
+    try:
+        QApplication.setHighDpiScaleFactorRoundingPolicy(
+            Qt.HighDpiScaleFactorRoundingPolicy.PassThrough)
+    except Exception:
+        pass
+
     app = QApplication(sys.argv)
     try:
-        app.setFont(QFont("Microsoft YaHei", 10))
+        app.setApplicationName("视频人脸检测比对工具")
+        app.setFont(_pick_ui_font())
+        app.setStyleSheet(APP_QSS)  # 全局扁平化主题
     except Exception:
         pass
     win = MainWindow()
@@ -2229,7 +2667,7 @@ def main():
             pass
         sys.exit(0)
 
-    sys.exit(app.exec_())
+    sys.exit(app.exec())
 
 
 if __name__ == "__main__":

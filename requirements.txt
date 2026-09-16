@@ -21,7 +21,8 @@ pillow>=9.0.0
 numpy>=1.23.0               # 建议 <2.0（insightface 生态兼容性更稳）
 
 # --- UI ---
-pyqt5>=5.15.0
+# V1.3 起界面由 PyQt5 迁移到 PyQt6（含 Qt6 运行时，pip 包名 pyqt6）
+pyqt6>=6.7.0
 
 # --- insightface 运行所需（因 --no-deps 而需手动补齐）---
 easydict

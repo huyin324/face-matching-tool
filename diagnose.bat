@@ -15,7 +15,7 @@ if not exist "%~dp0venv\Scripts\python.exe" (
 )
 
 call "%~dp0venv\Scripts\activate.bat" 2>nul
-set "QT_QPA_PLATFORM_PLUGIN_PATH=%~dp0venv\Lib\site-packages\PyQt5\Qt5\plugins"
+set "QT_QPA_PLATFORM_PLUGIN_PATH=%~dp0venv\Lib\site-packages\PyQt6\Qt6\plugins"
 "%~dp0venv\Scripts\python.exe" face_clip_qt.py > diagnose.log 2>&1
 set "RC=%errorlevel%"
 

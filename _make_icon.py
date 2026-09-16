@@ -1,7 +1,8 @@
 # 从 icon.svg 生成 icon.png（窗口图标）与 icon.ico（exe 图标）
+# 用法：.\venv\Scripts\python.exe _make_icon.py
 import os
-from PyQt5.QtSvg import QSvgRenderer
-from PyQt5.QtGui import QImage, QPainter, QColor
+from PyQt6.QtSvg import QSvgRenderer
+from PyQt6.QtGui import QImage, QPainter, QColor
 from PIL import Image
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -13,7 +14,7 @@ if not r.isValid():
 sizes = [256, 128, 64, 48, 32, 16]
 pngs = []
 for s in sizes:
-    img = QImage(s, s, QImage.Format_ARGB32)
+    img = QImage(s, s, QImage.Format.Format_ARGB32)
     img.fill(QColor(0, 0, 0, 0))
     p = QPainter(img)
     r.render(p)

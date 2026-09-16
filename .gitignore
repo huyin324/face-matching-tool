@@ -20,6 +20,7 @@ dist/
 crash.log
 launch.log
 models/
+_v13_result.txt
 
 # ---- 工程本地目录 ----
 .workbuddy/
